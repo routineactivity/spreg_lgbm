@@ -8,7 +8,7 @@ from shapely import wkt
 from sklearn.neighbors import BallTree
 from sklearn.neighbors import KernelDensity
 
-# ---- small geometry fallbacks (match your loader’s robustness) ----------------
+# geometry fallbacks
 try:
     import shapely
     from shapely.geometry import Point, Polygon
@@ -47,7 +47,7 @@ def _pick_geom_col(df):
             return lowmap[cand.lower()]
     return None
     
-# ---- grids / hexes ------------------------------------------------------------
+# grids / hexes
 def _make_square_grid(poly, cell_size_m: float) -> gpd.GeoDataFrame:
     """Square grid covering polygon extent; clipped to polygon; returns polygons with 'unit_id'."""
     minx, miny, maxx, maxy = poly.bounds
@@ -97,7 +97,7 @@ def _make_hex_grid(poly, edge_km: float) -> gpd.GeoDataFrame:
         while x <= maxx + w:
             # regular pointy-top hex centered at (x, y)
             cx, cy = x, y
-            # vertices (pointy-top) around center using edge a
+            # vertices (pointy-top) around centre using edge a
             verts = [
                 (cx + 0,     cy + a),
                 (cx + (sqrt(3)/2)*a, cy + a/2),
@@ -121,7 +121,7 @@ def _make_hex_grid(poly, edge_km: float) -> gpd.GeoDataFrame:
     hexes["unit_id"] = np.arange(len(hexes))
     return hexes
 
-# ---- KDE helper ---------------------------------------------------------------
+# KDE helper
 def _fit_kde(points_gdf: gpd.GeoDataFrame, bandwidth_m: float):
     """Fit sklearn KDE on x,y coordinates (assumes projected meters)."""
     if points_gdf is None or points_gdf.empty:
@@ -140,7 +140,7 @@ def _score_kde(kde, sample_points_gdf: gpd.GeoDataFrame, out_col: str):
     sample_points_gdf[out_col] = np.exp(kde.score_samples(samples))
     return sample_points_gdf
 
-# ---- main feature engineering -------------------------------------------------
+# main feature engineering
 def engineer_model_dataset(
     loader_out: Dict[str, Optional[gpd.GeoDataFrame]],
     unit_type: Literal["grid", "hex"] = "grid",
@@ -227,43 +227,67 @@ def engineer_model_dataset(
 
     return {"units": units, "spine": spine, "model": model}
 
-# --- for some demographic features ---
-def add_kde_features(
+# Adding some demographic features
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from scipy.signal import fftconvolve
+
+# helper: detect geometry column in CSV/DataFrame
+def _pick_geom_col(df):
+    candidates = ["geom", "geometry", "Geometry", "GEOMETRY", "WKT", "wkt", "wkt_geom"]
+    lowmap = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lowmap:
+            return lowmap[cand.lower()]
+    return None
+
+# helper: quartic (biweight) kernel, normalised so sum(k)*cell_area ≈ 1 (intensity per m²)
+def _quartic_kernel(radius_cells, cell_size):
+    R = int(np.ceil(radius_cells))
+    y, x = np.ogrid[-R:R+1, -R:R+1]
+    d = np.sqrt(x*x + y*y)
+    k = (1.0 - (d / R)**2)
+    k[k < 0] = 0.0
+    k = (k**2).astype(np.float32)
+    # Normalise to intensity per m²
+    k /= (k.sum() * (cell_size * cell_size))
+    return k
+
+# helper: bilinear sampler from float pixel coords
+def _bilinear(arr, xf, yf):
+    h, w = arr.shape
+    x0 = np.floor(xf).astype(int); y0 = np.floor(yf).astype(int)
+    x1 = np.clip(x0 + 1, 0, w - 1); y1 = np.clip(y0 + 1, 0, h - 1)
+    x0 = np.clip(x0, 0, w - 1);     y0 = np.clip(y0, 0, h - 1)
+    wx = xf - x0; wy = yf - y0
+    v00 = arr[y0, x0]; v10 = arr[y0, x1]
+    v01 = arr[y1, x0]; v11 = arr[y1, x1]
+    return (1-wx)*(1-wy)*v00 + wx*(1-wy)*v10 + (1-wx)*wy*v01 + wx*wy*v11
+
+def add_kde_regression_features(
     features: dict,
     source_path: str,
-    value_cols=("resident_pop","income_deprivation","employment_deprivation",
-                "youth_workday_pop","workers_workday_pop","elderly_workday_pop"),
-    bandwidth_m=400.0,
+    *,
+    pop_col="resident_pop",
+    count_cols=("resident_pop","youth_workday_pop","workers_workday_pop","elderly_workday_pop"),
+    avg_cols=("income_deprivation","employment_deprivation"),
+    bandwidth_m=400,
+    cell_size=100,
+    kernel="quartic",
     layer=None,
-    normalize=True,      # if True, applies 2D Gaussian normalization (1/(2πh²))
-    clip_to_units=True,  # if True, restricts census points to features["units"]
-    radius_factor=3.0    # search radius = radius_factor * bandwidth
+    fill_avg="zero"  # "zero" | "global_mean" | None (leave NaN)
 ):
     """
-    Adds KDE_* columns to features["model"] by kernel-smoothing weighted census centroids.
+    Adds KDE-style features to features["model"]:
+      - KDE_* : intensity per m² (quartic kernel by default)
+      - KWS_* : equivalent counts within radius (easier for regression)
+      - AVG_* : population-weighted averages for index variables
 
-    Parameters
-    ----------
-    features : dict with keys:
-        - "model": GeoDataFrame (points)
-        - "units": GeoDataFrame (polygons), same CRS as model (or reprojectable)
-    source_path : str
-        Path to CSV (expects 'wkt_geom') or GeoPackage (geometries stored natively).
-    value_cols : iterable of str
-        Columns in source to use as weights.
-    bandwidth_m : float
-        Spatial bandwidth in metres.
-    layer : str or None
-        GeoPackage layer name (ignored for CSV).
-    normalize : bool
-        If True, multiplies kernel by 1/(2πh²) yielding density per m².
-    clip_to_units : bool
-        If True, clips source points to the union of features["units"].
-    radius_factor : float
-        Multiplier for kernel search radius; 3≈99.7% mass for Gaussian.
+    Parameters align with your existing code and keep Step 1 & 2 intact.
     """
 
-    # --- 1) Validate inputs
+    # 1) Validate inputs
     if "model" not in features or "units" not in features:
         raise ValueError("features must contain 'model' (points) and 'units' (polygons).")
 
@@ -281,14 +305,14 @@ def add_kde_features(
     if gdf_model.crs.is_geographic:
         raise ValueError("Model CRS is geographic. Reproject to a metric CRS (e.g., EPSG:27700 or 3857).")
 
-    # --- 2) Read source points (CSV or GPKG) and align CRS
+    # 2) Read source points (CSV or GPKG) and align CRS
     if source_path.lower().endswith(".csv"):
         df_src = pd.read_csv(source_path)
         geom_col = _pick_geom_col(df_src)
         if not geom_col:
             raise ValueError("CSV must contain a geometry column named one of: "
                              "'geom', 'Geometry', 'geometry', 'WKT', or 'wkt_geom'.")
-    
+
         # Parse WKT if strings; accept shapely objects if present
         series = df_src[geom_col]
         if pd.api.types.is_string_dtype(series):
@@ -300,86 +324,118 @@ def add_kde_features(
                 geom = gpd.GeoSeries(series)
             else:
                 raise ValueError(f"Geometry column '{geom_col}' is not WKT or shapely geometries.")
-    
+
         gdf_src = gpd.GeoDataFrame(df_src.drop(columns=[geom_col]), geometry=geom, crs=gdf_model.crs)
 
     elif source_path.lower().endswith(".gpkg"):
         gdf_src = gpd.read_file(source_path, layer=layer) if layer else gpd.read_file(source_path)
-    
+
         # Ensure a geometry column is active; fallback to common names if needed
         try:
             _ = gdf_src.geometry  # access to confirm set
             geom_is_set = gdf_src._geometry_column_name in gdf_src.columns
         except Exception:
             geom_is_set = False
-    
+
         if not geom_is_set:
             geom_col = _pick_geom_col(gdf_src)
             if not geom_col:
                 raise ValueError("GeoPackage has no active geometry and no column named "
                                  "'geom', 'Geometry', 'geometry', 'WKT', or 'wkt_geom'.")
             gdf_src = gdf_src.set_geometry(geom_col)
-    
+
         # Align CRS to model
         if gdf_src.crs != gdf_model.crs:
             gdf_src = gdf_src.to_crs(gdf_model.crs)
-    
+
     else:
         raise ValueError("source_path must be a .csv or .gpkg")
 
-    # --- 3) Clip to units if requested
-    if clip_to_units:
-        ua = gdf_units.unary_union
-        gdf_src = gdf_src[gdf_src.geometry.within(ua)].copy()
-
+    # 3) Clip source points to units
+    if not gdf_src.empty:
+        # spatial join is faster than .within(unary_union) for larger sets
+        gdf_src = gpd.sjoin(gdf_src, gdf_units[["geometry"]], predicate="within", how="inner").drop(columns=["index_right"])
     if gdf_src.empty:
-        # Create zero-valued KDE columns and return early
-        for c in value_cols:
-            gdf_model[f'KDE_{c}'] = 0.0
+        # If nothing left after clip: create zero outputs and return
+        for c in count_cols:
+            gdf_model[f"KDE_{c}"] = 0.0
+            gdf_model[f"KWS_{c}"] = 0.0
+        for c in avg_cols:
+            if fill_avg == "zero":
+                gdf_model[f"AVG_{c}"] = 0.0
+            elif fill_avg == "global_mean":
+                # no data -> fall back to 0; caller can overwrite later
+                gdf_model[f"AVG_{c}"] = 0.0
+            else:
+                gdf_model[f"AVG_{c}"] = np.nan
         features["model"] = gdf_model
         return features
 
-    # --- 4) Build spatial index (BallTree on Euclidean coordinates)
-    # Extract coordinates
-    X_src = np.vstack([gdf_src.geometry.x.values, gdf_src.geometry.y.values]).T
-    X_tgt = np.vstack([gdf_model.geometry.x.values, gdf_model.geometry.y.values]).T
+    # Ensure required columns exist
+    missing_counts = [c for c in count_cols if c not in gdf_src.columns]
+    missing_avgs   = [c for c in avg_cols   if c not in gdf_src.columns]
+    if missing_counts or missing_avgs or pop_col not in gdf_src.columns:
+        raise ValueError(f"Source missing columns. "
+                         f"Counts missing: {missing_counts}; Averages missing: {missing_avgs}; "
+                         f"pop_col present: {pop_col in gdf_src.columns}")
 
-    # BallTree requires a metric; use 'euclidean'
-    tree = BallTree(X_src, metric='euclidean')
+    # 4) Prepare raster extent (units bbox + pad by radius)
+    xmin, ymin, xmax, ymax = gdf_units.total_bounds
+    pad = bandwidth_m + cell_size
+    xmin -= pad; ymin -= pad; xmax += pad; ymax += pad
+    width  = int(np.ceil((xmax - xmin) / cell_size))
+    height = int(np.ceil((ymax - ymin) / cell_size))
 
-    # Query neighbors within radius
-    radius = radius_factor * bandwidth_m
-    ind_list = tree.query_radius(X_tgt, r=radius, return_distance=False)
+    # Map points -> cell indices
+    xs = (gdf_src.geometry.x.values - xmin) / cell_size
+    ys = (ymax - gdf_src.geometry.y.values) / cell_size
+    cols = xs.astype(int); rows = ys.astype(int)
+    good = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
 
-    # Kernel constants
-    h = float(bandwidth_m)
-    inv_h2 = 1.0 / (h * h)
-    norm = (1.0 / (2.0 * np.pi * h * h)) if normalize else 1.0
+    # Float pixel coords for model sampling
+    mx = (gdf_model.geometry.x.values - xmin) / cell_size
+    my = (ymax - gdf_model.geometry.y.values) / cell_size
 
-    # Pre-fetch weights as array
-    W = gdf_src[list(value_cols)].to_numpy(dtype=float)
+    # Kernel
+    if kernel.lower() != "quartic":
+        raise ValueError("Only 'quartic' is implemented here")
+    K = _quartic_kernel(bandwidth_m / cell_size, cell_size)
 
-    # --- 5) Compute KDE for each target and each column
-    kde_arrays = {c: np.zeros(len(gdf_model), dtype=float) for c in value_cols}
+    # Area factor to convert intensity (per m²) to equivalent count in a 400m radius
+    # For quartic kernel, ∫K dA = 1; equivalent count within the radius is intensity * area_of_support
+    # Use biweight effective area: (π/3) * R^2
+    area_factor = (np.pi / 3.0) * (bandwidth_m ** 2)
 
-    # To avoid recomputing distances for each column, do per-target once
-    for i, nbr_idx in enumerate(ind_list):
-        if nbr_idx.size == 0:
-            continue
-        # Distances from target i to its neighbors
-        dx = X_src[nbr_idx, 0] - X_tgt[i, 0]
-        dy = X_src[nbr_idx, 1] - X_tgt[i, 1]
-        d2 = dx*dx + dy*dy
-        # Gaussian kernel weights: exp(-d^2 / (2h^2))
-        k = np.exp(-0.5 * d2 * inv_h2) * norm
-        # Accumulate per attribute
-        for j, col in enumerate(value_cols):
-            # Weighted sum of kernels
-            kde_arrays[col][i] = np.dot(W[nbr_idx, j], k)
+    def _convolve(values: np.ndarray) -> np.ndarray:
+        grid = np.zeros((height, width), dtype=np.float32)
+        np.add.at(grid, (rows[good], cols[good]), values[good].astype(np.float32))
+        return fftconvolve(grid, K, mode="same")  # intensity per m²
 
-    # --- 6) Attach to model with KDE_ prefix
-    for col in value_cols:
-        gdf_model[f'KDE_{col}'] = kde_arrays[col]
+    # 5) Counts → KDE (intensity) and KWS (equiv. count)
+    for c in count_cols:
+        intensity = _convolve(gdf_src[c].values)
+        eq_count  = intensity * area_factor
+        gdf_model[f"KDE_{c}"] = _bilinear(intensity, mx, my).astype(np.float32)
+        gdf_model[f"KWS_{c}"] = _bilinear(eq_count,  mx, my).astype(np.float32)
+        # zero-fill for empty neighborhoods
+        gdf_model[f"KDE_{c}"] = gdf_model[f"KDE_{c}"].fillna(0.0)
+        gdf_model[f"KWS_{c}"] = gdf_model[f"KWS_{c}"].fillna(0.0)
+
+    # 6) Population-weighted averages for index/proportion cols
+    pop_intensity = _convolve(gdf_src[pop_col].values)     # per m²
+    pop_eq = pop_intensity * area_factor                   # equiv. count
+    denom = _bilinear(pop_eq, mx, my)                      # at target points
+
+    for c in avg_cols:
+        num = _convolve((gdf_src[c].values * gdf_src[pop_col].values).astype(np.float32)) * area_factor
+        num_pts = _bilinear(num, mx, my)
+        avg = np.divide(num_pts, denom, out=np.full_like(num_pts, np.nan, dtype=np.float32), where=denom > 0)
+        if fill_avg == "zero":
+            avg = np.nan_to_num(avg, nan=0.0)
+        elif fill_avg == "global_mean":
+            m = np.nanmean(avg)
+            avg = np.where(np.isnan(avg), m, avg).astype(np.float32)
+        gdf_model[f"AVG_{c}"] = avg.astype(np.float32)
 
     features["model"] = gdf_model
     return features

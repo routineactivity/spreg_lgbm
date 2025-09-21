@@ -49,7 +49,7 @@ def _narrative_top_positive(feature_summary: pd.DataFrame, k: int = 5) -> str:
         )
     return "\n".join(lines)
 
-# Fit Model and Contribs
+# Fit Model and Contributions
 def fit_lightgbm_kde_dist(
     df: pd.DataFrame,
     use_crime_count: bool = True,
@@ -64,7 +64,9 @@ def fit_lightgbm_kde_dist(
     # Features
     kde_cols  = [c for c in df.columns if c.startswith("KDE_")]
     dist_cols = [c for c in df.columns if c.startswith("Dist_")]
-    feature_cols = kde_cols + dist_cols
+    kws_cols = [c for c in df.columns if c.startswith("KWS_")] 
+    avg_cols = [c for c in df.columns if c.startswith("AVG_")]
+    feature_cols = kde_cols + dist_cols + kws_cols + avg_cols
     if not feature_cols:
         raise ValueError("No features found. Expect columns starting with KDE_ and/or Dist_.")
     

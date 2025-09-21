@@ -18,7 +18,7 @@ except Exception:  # very rare
 
 DEFAULT_CRS = "EPSG:27700"
 
-# ---------------- helpers ----------------
+# helpers
 
 def _ensure_crs(gdf: gpd.GeoDataFrame, target_crs: str) -> gpd.GeoDataFrame:
     if gdf.crs is None:
